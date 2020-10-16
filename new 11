@@ -1,0 +1,163 @@
+# Input bindings are passed in via param block.
+param($Timer)
+
+# Get the current universal time in the default string format
+$currentUTCtime = (Get-Date).ToUniversalTime()
+
+# The 'IsPastDue' porperty is 'true' when the current function invocation is later than scheduled.
+if ($Timer.IsPastDue) {
+    Write-Host "PowerShell timer is running late!"
+}
+
+# Write an information log with the current time.
+Write-Host "PowerShell timer trigger function ran! TIME: $currentUTCtime";
+
+try
+{
+    $returnVal = "Reading from $($env:KeyVaultName) key vault"
+    $UserName = (Get-AzKeyVaultSecret -vaultName $env:KeyVaultName -name $env:KeyVaultSecretNameAuditLogUsername).SecretValueText
+    $returnVal += "`r`n$($env:KeyVaultSecretNameAuditLogUsername) username secret"
+    $returnVal += "`r`n$UserName username";
+
+    $PlainPassword = (Get-AzKeyVaultSecret -vaultName $env:KeyVaultName -name $env:KeyVaultSecretNameAuditLogPassword).SecretValueText
+    $SecurePassword = $PlainPassword | ConvertTo-SecureString -AsPlainText -Force
+    $UserCredential = New-Object System.Management.Automation.PSCredential -ArgumentList $UserName, $SecurePassword
+
+    $PowerBIUser = "ABTech Data Solutions Dev Power BI Log Export Service Principal"
+    $PowerBIPass = "0.i9faRUmY.H7gRvFT-Btyz3ov62P~I_MH"
+    $SecurePBIPassword = $PowerBIPass | ConvertTo-SecureString -AsPlainText -Force
+    $PBIUserCredential = New-Object System.Management.Automation.PSCredential -ArgumentList $PowerBIUser, $SecurePBIPassword
+
+    
+
+    $resourceAppIdURI = 'https://database.windows.net/'
+    $endpoint = "$($env:MSI_ENDPOINT)/?resource=$resourceAppIdURI&api-version=2017-09-01";
+    $header = @{'Secret' = $env:MSI_SECRET}
+    $authenticationResult = Invoke-RestMethod -Method Get -Headers $header -Uri $endpoint
+    $AccessToken = $authenticationResult.access_token
+    Write-Host($authenticationResult)
+    ## open SQL connection using token from the MSI
+    Write-Host "Connecting to Azure SQL: $env:SQLCONNSTR_SQLConnectionString"
+    $sqlConnection = New-Object -TypeName System.Data.SqlClient.SqlConnection($env:SQLCONNSTR_SQLConnectionString)
+    $sqlConnection.AccessToken = $AccessToken
+    $sqlConnection.Open()
+
+    $sqlCommand = new-object System.Data.SqlClient.SqlCommand
+    $sqlCommand.CommandTimeout = 120
+    $sqlCommand.Connection = $sqlConnection
+    $sqlCommand.CommandText= 'if object_id(''dbo.PBIAuditLogs'') is null
+    create table dbo.PBIAuditLogs (
+        RunspaceId uniqueidentifier,
+        [Identity] uniqueidentifier,
+        UserIds varchar(45),
+        Operations varchar(30),
+        AuditData varchar(max),
+        CreationDate datetime,
+        RowModifiedDate datetime,
+        CONSTRAINT PrK primary key clustered ([Identity])
+    )';
+    $result = $sqlCommand.ExecuteNonQuery();
+
+    $sqlCommand.CommandText= 'create or alter proc dbo.uspLoadDatasetAuditLogs
+        @RunspaceId uniqueidentifier,
+        @Identity uniqueidentifier,
+        @UserIds varchar(45),
+        @Operations varchar(30),
+        @AuditData varchar(max),
+        @CreationDate datetime
+    as
+    begin
+        if exists (
+            select 1 
+            from dbo.PBIAuditLogs
+            where [Identity] = @Identity
+        )
+        begin
+            update dbo.PBIAuditLogs
+            set UserIds = @UserIds,
+                RunspaceId = @RunspaceId,
+                Operations = @Operations,
+                AuditData = @AuditData,
+                CreationDate = @CreationDate,
+                RowModifiedDate = getdate()
+            where [Identity] = @Identity
+        end
+        else
+        begin
+            insert dbo.PBIAuditLogs (
+                RunspaceId,
+                [Identity],
+                UserIds,
+                Operations,
+                AuditData,
+                CreationDate,
+                RowModifiedDate
+            )
+            values (
+                @RunspaceId,
+                @Identity,
+                @UserIds,
+                @Operations,
+                @AuditData,
+                @CreationDate,
+                getdate()
+            )
+        end
+    end';
+    $result = $sqlCommand.ExecuteNonQuery();
+
+    [DateTime]$maxDateLoaded = (Get-Date).AddDays(-90);
+    $sqlCommand.CommandText = 'select max(CreationDate) as MaxCreationDate from dbo.PBIAuditLogs';
+    $maxCreationDateReader = $sqlCommand.ExecuteReader();
+    $maxCreationDateReader.Read() | Out-Null;
+    if (!$maxCreationDateReader.IsDbNull(0))
+    {
+        $maxDateLoaded = $maxCreationDateReader[0];
+        $maxDateLoaded = $maxDateLoaded.AddDays(-1);
+    }
+    "Loading new audit logs from $maxDateLoaded"
+    $maxCreationDateReader.Close();
+
+    $Session = New-PSSession -ConfigurationName Microsoft.Exchange -ConnectionUri https://outlook.office365.com/powershell-liveid/ -Credential $PBIUserCredential -Authentication Basic -AllowRedirection
+    Import-Module (Import-PSSession -Session $Session -AllowClobber -DisableNameChecking) -Global
+
+    $maxResultSize = 5000; #5000 max audit events can be received from Search-UnifiedAuditLog at a time
+    $minAuditLogDateReceived = (Get-Date).AddDays(1)
+
+    $row = $maxResultSize;
+
+    while ($row -ge $maxResultSize)
+    {
+        $sessionID = (New-Guid).ToString();
+        $output = Search-UnifiedAuditLog -StartDate $maxDateLoaded -EndDate $minAuditLogDateReceived -RecordType PowerBI -ResultSize $maxResultSize -SessionID $sessionID -SessionCommand ReturnNextPreviewPage
+        $returnVal += "`r`npage with $($output.Length) logs"
+
+        $row = 0;
+        foreach ($Audit in $output)
+        {
+            $row++;
+            $minAuditLogDateReceived = $Audit.CreationDate;
+            $totalRows++;
+            $returnVal += "`r`n$($Audit.ResultIndex) - $row - $($Audit.CreationDate) - $($Audit.Identity)"
+            $sqlCommand.CommandText = "exec dbo.uspLoadDatasetAuditLogs @RunspaceId, @Identity, @UserIds, @Operations, @AuditData, @CreationDate";
+            $sqlCommand.Parameters.Clear();
+            $sqlCommand.Parameters.AddWithValue("@RunspaceId",$Audit.RunspaceId) | Out-Null;
+            $sqlCommand.Parameters.AddWithValue("@Identity",$Audit.Identity) | Out-Null;
+            $sqlCommand.Parameters.AddWithValue("@UserIds",$Audit.UserIds) | Out-Null;
+            $sqlCommand.Parameters.AddWithValue("@Operations",$Audit.Operations) | Out-Null;
+            $sqlCommand.Parameters.AddWithValue("@AuditData",$Audit.AuditData) | Out-Null;
+            $sqlCommand.Parameters.AddWithValue("@CreationDate",$Audit.CreationDate) | Out-Null;
+            $result = $sqlCommand.ExecuteNonQuery();
+        }
+    }
+
+    $sqlConnection.Close()
+    $sqlConnection.Dispose()
+}
+catch {
+    throw $_
+}
+finally {
+    Write-Host $returnVal
+    #Remove-PSSession -Id $Session.Id
+}
